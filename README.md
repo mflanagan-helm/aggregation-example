@@ -1,4 +1,4 @@
-The Main.scala code demonstrates the aggregation step in our entity resolution pipeline.
+The [src/main/scala/Main.scala](src/main/scala/Main.scala) code demonstrates the aggregation step in our entity resolution pipeline.
 This toy example has three record types
 
 `CustomerProfile`
