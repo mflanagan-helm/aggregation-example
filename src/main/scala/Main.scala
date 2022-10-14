@@ -1,4 +1,4 @@
-import org.apache.kafka.streams.TopologyTestDriver
+import org.apache.kafka.streams.{KeyValue, TopologyTestDriver}
 import org.apache.kafka.streams.scala.ImplicitConversions._
 import org.apache.kafka.streams.scala.StreamsBuilder
 import org.apache.kafka.streams.scala.serialization.Serdes
@@ -6,8 +6,11 @@ import Json4SSerde.JsonSerde
 
 case class CustomerProfile(id: Int, key: String, value: Double)
 case class VoterRecord(id: Int, key: String, value: Double)
-case class Match(cp_id: Int, vr_id: Int)
 case class Matches(cp_id: Int, vr_ids: List[Int])
+case class Match(cp_id: Int, vr_id: Int)
+case class MatchWithVr(cp_id: Int, vr: VoterRecord)
+case class MatchWithCpVr(cp: CustomerProfile, vr: VoterRecord)
+case class Score(cp_id: Int, vr_id: Int, score: Double)
 case class ResolvedProfile(cp_id: Int, vr_id: Int)
 
 object Main {
@@ -16,13 +19,19 @@ object Main {
   implicit val voterRecordSerde = new JsonSerde[VoterRecord]
   implicit val matchSerde = new JsonSerde[Match]
   implicit val matchesSerde = new JsonSerde[Matches]
+  implicit val matchWithVrSerde = new JsonSerde[MatchWithVr]
+  implicit val matchWithCpVrSerde = new JsonSerde[MatchWithCpVr]
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
+  implicit val scoreSerde = new JsonSerde[Score]
   implicit val voterRecordMapSerde = new JsonSerde[Map[Int, VoterRecord]]
 
   val CustomerProfileTopic = "CustomerProfile"
   val VoterRecordTopic = "VoterRecord"
   val MatchTopic = "Match"
   val MatchesTopic = "Matches"
+  val MatchWithVrTopic = "MatchWithVr"
+  val MatchWithCpVrTopic = "MatchWithCpVr"
+  val ScoreTopic = "Score"
   val ResolvedProfileTopic = "ResolvedProfile"
 
   def buildTopology() = {
@@ -30,6 +39,8 @@ object Main {
 
     val customerProfileStream = builder
       .stream[Int, CustomerProfile](CustomerProfileTopic)
+
+    val customerProfileTable = customerProfileStream.toTable
 
     val voterRecordTable = builder
       .table[Int, VoterRecord](VoterRecordTopic)
@@ -63,6 +74,18 @@ object Main {
     val matchStream = matchesStream
       .flatMapValues(v => v.vr_ids.map(vr_id => Match(v.cp_id, vr_id)))
     matchStream.to(MatchTopic)
+
+    val matchWithCpVrStream = matchStream
+      .selectKey((_, m) => m.vr_id)
+      .join(voterRecordTable)((m: Match, vr: VoterRecord) => MatchWithVr(m.cp_id, vr))
+      .selectKey((_, m) => m.cp_id)
+      .join(customerProfileTable)((m: MatchWithVr, cp: CustomerProfile) => MatchWithCpVr(cp, m.vr))
+
+    matchWithCpVrStream.to(MatchWithCpVrTopic)
+
+    val scoreStream = matchWithCpVrStream
+      .mapValues(m => Score(m.cp.id, m.vr.id, (m.cp.value - m.vr.value).abs))
+    scoreStream.to(ScoreTopic)
 
     customerProfileStream
       .selectKey((_, cp) => cp.key)
@@ -101,6 +124,17 @@ object Main {
       matchSerde.deserializer()
     )
 
+    val matchWithCpVrOutputTopic = driver.createOutputTopic(
+      MatchWithCpVrTopic,
+      intSerde.deserializer(),
+      matchWithCpVrSerde.deserializer()
+    )
+
+    val scoreOutputTopic = driver.createOutputTopic(
+      ScoreTopic,
+      intSerde.deserializer(),
+      scoreSerde.deserializer()
+    )
     val resolvedProfileOutputTopic = driver.createOutputTopic(
       ResolvedProfileTopic,
       intSerde.deserializer(),
@@ -145,5 +179,26 @@ object Main {
     assert(matchList(5) == Match(7, 3))
     assert(matchList(6) == Match(8, 2))
     assert(matchList(7) == Match(8, 4))
+
+    val matchWithCpVrs = matchWithCpVrOutputTopic.readKeyValuesToList().toArray()
+    assert(matchWithCpVrs(0) == new KeyValue(5, MatchWithCpVr(CustomerProfile(5, "a", 0.5), VoterRecord(1, "a", 1.0))))
+    assert(matchWithCpVrs(1) == new KeyValue(5, MatchWithCpVr(CustomerProfile(5, "a", 0.5), VoterRecord(3, "a", 3.0))))
+    assert(matchWithCpVrs(2) == new KeyValue(6, MatchWithCpVr(CustomerProfile(6, "b", 1.0), VoterRecord(2, "b", 2.0))))
+    assert(matchWithCpVrs(3) == new KeyValue(6, MatchWithCpVr(CustomerProfile(6, "b", 1.0), VoterRecord(4, "b", 4.0))))
+    assert(matchWithCpVrs(4) == new KeyValue(7, MatchWithCpVr(CustomerProfile(7, "a", 2.5), VoterRecord(1, "a", 1.0))))
+    assert(matchWithCpVrs(5) == new KeyValue(7, MatchWithCpVr(CustomerProfile(7, "a", 2.5), VoterRecord(3, "a", 3.0))))
+    assert(matchWithCpVrs(6) == new KeyValue(8, MatchWithCpVr(CustomerProfile(8, "b", 3.5), VoterRecord(2, "b", 2.0))))
+    assert(matchWithCpVrs(7) == new KeyValue(8, MatchWithCpVr(CustomerProfile(8, "b", 3.5), VoterRecord(4, "b", 4.0))))
+
+    val scores = scoreOutputTopic.readKeyValuesToList().toArray()
+    assert(scores(0) == new KeyValue(5, Score(5, 1, .5)))
+    assert(scores(1) == new KeyValue(5, Score(5, 3, 2.5)))
+    assert(scores(2) == new KeyValue(6, Score(6, 2, 1.0)))
+    assert(scores(3) == new KeyValue(6, Score(6, 4, 3.0)))
+    assert(scores(4) == new KeyValue(7, Score(7, 1, 1.5)))
+    assert(scores(5) == new KeyValue(7, Score(7, 3, .5)))
+    assert(scores(6) == new KeyValue(8, Score(8, 2, 1.5)))
+    assert(scores(7) == new KeyValue(8, Score(8, 4, .5)))
+
   }
 }
