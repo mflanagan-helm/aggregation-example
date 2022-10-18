@@ -19,7 +19,6 @@ object Main {
   implicit val voterRecordSerde = new JsonSerde[VoterRecord]
   implicit val matchSerde = new JsonSerde[Match]
   implicit val matchWithVrSerde = new JsonSerde[MatchWithVr]
-  implicit val matchWithCpVrSerde = new JsonSerde[MatchWithCpVr]
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
   implicit val scoreSerde = new JsonSerde[Score]
   implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
@@ -36,11 +35,11 @@ object Main {
     val customerProfileTable = customerProfileStream.toTable
     val voterRecordStream = builder.stream[Int, VoterRecord](VoterRecordTopic)
     val voterRecordTable = voterRecordStream.toTable
-    val voterRecordIdsByKeyTable = voterRecordTable
-      .groupBy((_, vr) => (vr.key, vr))
+    val voterRecordIdsByKeyTable = voterRecordStream
+      .selectKey((_, vr) => vr.key)
+      .groupByKey
       .aggregate(Set(): Set[Int])(
         (_, vr, set) => set + vr.id,
-        (_, vr, set) => set - vr.id
       )
 
     customerProfileStream
