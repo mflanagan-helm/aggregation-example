@@ -8,8 +8,6 @@ case class CustomerProfile(id: Int, key: String, value: Double)
 case class VoterRecord(id: Int, key: String, value: Double)
 case class CpMatches(cp: CustomerProfile, vr_ids: Set[Int])
 case class CpMatch(cp: CustomerProfile, vr_id: Int)
-case class VrMatches(vr: VoterRecord, cp_ids: Set[Int])
-case class VrMatch(vr: VoterRecord, cp_id: Int)
 case class Match(cp: CustomerProfile, vr: VoterRecord)
 case class Score(cp_id: Int, vr_id: Int, score: Double)
 case class ResolvedProfile(cp_id: Int, vr_id: Int)
@@ -18,15 +16,13 @@ object Main {
   import Serdes._
   implicit val customerProfileSerde = new JsonSerde[CustomerProfile]
   implicit val voterRecordSerde = new JsonSerde[VoterRecord]
+  implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
   implicit val cpMatches = new JsonSerde[CpMatches]
   implicit val cpMatch = new JsonSerde[CpMatch]
-  implicit val vrMatches = new JsonSerde[VrMatches]
-  implicit val vrMatch = new JsonSerde[VrMatch]
   implicit val matchSerde = new JsonSerde[Match]
-  implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
   implicit val scoreSerde = new JsonSerde[Score]
-  implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
   implicit val optionalMinScoreSerde = new JsonSerde[Option[Score]]
+  implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
 
   val CustomerProfileTopic = "CustomerProfile"
   val VoterRecordTopic = "VoterRecord"
@@ -35,42 +31,22 @@ object Main {
   def buildTopology() = {
     val builder = new StreamsBuilder
     val customerProfileStream = builder.stream[Int, CustomerProfile](CustomerProfileTopic)
-    val customerProfileTable = customerProfileStream.toTable
-    val customerProfileIdsByKeyTable = customerProfileStream
-      .selectKey((_, cp) => cp.key)
-      .groupByKey
-      .aggregate(Set(): Set[Int])(
-        (_, cp, set) => set + cp.id,
-      )
-
-    val voterRecordStream = builder.stream[Int, VoterRecord](VoterRecordTopic)
-    val voterRecordTable = voterRecordStream.toTable
-    val voterRecordIdsByKeyTable = voterRecordStream
-      .selectKey((_, vr) => vr.key)
-      .groupByKey
+    val voterRecordTable = builder.table[Int, VoterRecord](VoterRecordTopic)
+    val voterRecordIdsByKeyTable = voterRecordTable
+      .groupBy((_, vr) => (vr.key, vr))
       .aggregate(Set(): Set[Int])(
         (_, vr, set) => set + vr.id,
+        (_, vr, set) => set - vr.id
       )
 
-    val cpMatches = customerProfileStream
+    customerProfileStream
       .selectKey((_, cp) => cp.key)
-      .join(voterRecordIdsByKeyTable)((cp: CustomerProfile, vr_ids: Set[Int]) => CpMatches(cp, vr_ids) )
+      .join(voterRecordIdsByKeyTable)((cp, vr_ids) => CpMatches(cp, vr_ids) )
       .flatMapValues(v => v.vr_ids.map(vr_id => CpMatch(v.cp, vr_id)))
       .selectKey((_, m) => m.vr_id)
-      .join(voterRecordTable)((m: CpMatch, vr: VoterRecord) => Match(m.cp, vr))
-
-    val vrMatches = voterRecordStream
-      .selectKey((_, vr) => vr.key)
-      .join(voterRecordIdsByKeyTable)((vr: VoterRecord, cp_ids: Set[Int]) => VrMatches(vr, cp_ids) )
-      .flatMapValues(v => v.cp_ids.map(cp_id => VrMatch(v.vr, cp_id)))
-      .selectKey((_, m) => m.cp_id)
-      .join(customerProfileTable)((m: VrMatch, cp: CustomerProfile) => Match(cp, m.vr))
-
-    cpMatches
-      .merge(vrMatches)
+      .join(voterRecordTable)((m, vr) => Match(m.cp, vr))
       .mapValues(m => Score(m.cp.id, m.vr.id, (m.cp.value - m.vr.value).abs))
-      .selectKey((_, s) => s.cp_id)
-      .groupByKey
+      .groupBy((_, s) => s.cp_id)
       .aggregate(None: Option[Score])(
         (_, score, optMinScore) => {
           val minScore = optMinScore.getOrElse(score)
@@ -101,6 +77,11 @@ object Main {
       voterRecordSerde.serializer()
     )
 
+    val voterRecordInputTopicForDeletes = driver.createInputTopic(
+      VoterRecordTopic,
+      intSerde.serializer(),
+      byteArraySerde.serializer()
+    )
     val resolvedProfileOutputTopic = driver.createOutputTopic(
       ResolvedProfileTopic,
       intSerde.deserializer(),
