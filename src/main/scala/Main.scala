@@ -24,6 +24,7 @@ object Main {
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
   implicit val scoreSerde = new JsonSerde[Score]
   implicit val voterRecordMapSerde = new JsonSerde[Map[Int, VoterRecord]]
+  implicit val optionalMinScoreSerde = new JsonSerde[Option[Score]]
 
   val CustomerProfileTopic = "CustomerProfile"
   val VoterRecordTopic = "VoterRecord"
@@ -33,6 +34,7 @@ object Main {
   val MatchWithCpVrTopic = "MatchWithCpVr"
   val ScoreTopic = "Score"
   val ResolvedProfileTopic = "ResolvedProfile"
+  val ResolvedProfile2Topic = "ResolvedProfile2"
 
   def buildTopology() = {
     val builder = new StreamsBuilder
@@ -87,11 +89,31 @@ object Main {
       .mapValues(m => Score(m.cp.id, m.vr.id, (m.cp.value - m.vr.value).abs))
     scoreStream.to(ScoreTopic)
 
-    customerProfileStream
+
+
+    val resolvedProfileStream = customerProfileStream
       .selectKey((_, cp) => cp.key)
       .join(voterRecordsByKeyTable)(resolve)
       .selectKey((_, rp) => rp.cp_id)
-      .to(ResolvedProfileTopic)
+    resolvedProfileStream.to(ResolvedProfileTopic)
+
+    var resolvedProfile2Stream = scoreStream
+      .groupByKey
+      .aggregate(None: Option[Score])(
+        (_, score, optMinScore) => {
+          val minScore = optMinScore.getOrElse(score)
+          if (score.score < minScore.score) {
+            Some(score)
+          }
+          else {
+            Some(minScore)
+          }
+        }
+      )
+      .toStream
+      .mapValues(optMinScore => optMinScore.get)
+      .mapValues(score => ResolvedProfile(score.cp_id, score.vr_id))
+    resolvedProfile2Stream.to(ResolvedProfile2Topic)
 
     builder.build()
   }
@@ -135,8 +157,14 @@ object Main {
       intSerde.deserializer(),
       scoreSerde.deserializer()
     )
+
     val resolvedProfileOutputTopic = driver.createOutputTopic(
       ResolvedProfileTopic,
+      intSerde.deserializer(),
+      resolvedProfileSerde.deserializer())
+
+    val resolvedProfile2OutputTopic = driver.createOutputTopic(
+      ResolvedProfile2Topic,
       intSerde.deserializer(),
       resolvedProfileSerde.deserializer())
 
@@ -199,6 +227,16 @@ object Main {
     assert(scores(5) == new KeyValue(7, Score(7, 3, .5)))
     assert(scores(6) == new KeyValue(8, Score(8, 2, 1.5)))
     assert(scores(7) == new KeyValue(8, Score(8, 4, .5)))
+
+    val resolvedProfiles2 = resolvedProfile2OutputTopic.readKeyValuesToList().toArray()
+    assert(resolvedProfiles2(0) == new KeyValue(5, ResolvedProfile(5, 1)))
+    assert(resolvedProfiles2(1) == new KeyValue(5, ResolvedProfile(5, 1)))
+    assert(resolvedProfiles2(2) == new KeyValue(6, ResolvedProfile(6, 2)))
+    assert(resolvedProfiles2(3) == new KeyValue(6, ResolvedProfile(6, 2)))
+    assert(resolvedProfiles2(4) == new KeyValue(7, ResolvedProfile(7, 1)))
+    assert(resolvedProfiles2(5) == new KeyValue(7, ResolvedProfile(7, 3)))
+    assert(resolvedProfiles2(6) == new KeyValue(8, ResolvedProfile(8, 2)))
+    assert(resolvedProfiles2(7) == new KeyValue(8, ResolvedProfile(8, 4)))
 
   }
 }
