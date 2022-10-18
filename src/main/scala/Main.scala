@@ -6,10 +6,11 @@ import Json4SSerde.JsonSerde
 
 case class CustomerProfile(id: Int, key: String, value: Double)
 case class VoterRecord(id: Int, key: String, value: Double)
-case class Matches(cp_id: Int, vr_ids: Set[Int])
-case class Match(cp_id: Int, vr_id: Int)
-case class MatchWithVr(cp_id: Int, vr: VoterRecord)
-case class MatchWithCpVr(cp: CustomerProfile, vr: VoterRecord)
+case class CpMatches(cp: CustomerProfile, vr_ids: Set[Int])
+case class CpMatch(cp: CustomerProfile, vr_id: Int)
+case class VrMatches(vr: VoterRecord, cp_ids: Set[Int])
+case class VrMatch(vr: VoterRecord, cp_id: Int)
+case class Match(cp: CustomerProfile, vr: VoterRecord)
 case class Score(cp_id: Int, vr_id: Int, score: Double)
 case class ResolvedProfile(cp_id: Int, vr_id: Int)
 
@@ -17,8 +18,11 @@ object Main {
   import Serdes._
   implicit val customerProfileSerde = new JsonSerde[CustomerProfile]
   implicit val voterRecordSerde = new JsonSerde[VoterRecord]
+  implicit val cpMatches = new JsonSerde[CpMatches]
+  implicit val cpMatch = new JsonSerde[CpMatch]
+  implicit val vrMatches = new JsonSerde[VrMatches]
+  implicit val vrMatch = new JsonSerde[VrMatch]
   implicit val matchSerde = new JsonSerde[Match]
-  implicit val matchWithVrSerde = new JsonSerde[MatchWithVr]
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
   implicit val scoreSerde = new JsonSerde[Score]
   implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
@@ -30,9 +34,15 @@ object Main {
 
   def buildTopology() = {
     val builder = new StreamsBuilder
-
     val customerProfileStream = builder.stream[Int, CustomerProfile](CustomerProfileTopic)
     val customerProfileTable = customerProfileStream.toTable
+    val customerProfileIdsByKeyTable = customerProfileStream
+      .selectKey((_, cp) => cp.key)
+      .groupByKey
+      .aggregate(Set(): Set[Int])(
+        (_, cp, set) => set + cp.id,
+      )
+
     val voterRecordStream = builder.stream[Int, VoterRecord](VoterRecordTopic)
     val voterRecordTable = voterRecordStream.toTable
     val voterRecordIdsByKeyTable = voterRecordStream
@@ -42,15 +52,24 @@ object Main {
         (_, vr, set) => set + vr.id,
       )
 
-    customerProfileStream
+    val cpMatches = customerProfileStream
       .selectKey((_, cp) => cp.key)
-      .join(voterRecordIdsByKeyTable)((cp: CustomerProfile, vr_ids: Set[Int]) => Matches(cp.id, vr_ids) )
-      .flatMapValues(v => v.vr_ids.map(vr_id => Match(v.cp_id, vr_id)))
+      .join(voterRecordIdsByKeyTable)((cp: CustomerProfile, vr_ids: Set[Int]) => CpMatches(cp, vr_ids) )
+      .flatMapValues(v => v.vr_ids.map(vr_id => CpMatch(v.cp, vr_id)))
       .selectKey((_, m) => m.vr_id)
-      .join(voterRecordTable)((m: Match, vr: VoterRecord) => MatchWithVr(m.cp_id, vr))
+      .join(voterRecordTable)((m: CpMatch, vr: VoterRecord) => Match(m.cp, vr))
+
+    val vrMatches = voterRecordStream
+      .selectKey((_, vr) => vr.key)
+      .join(voterRecordIdsByKeyTable)((vr: VoterRecord, cp_ids: Set[Int]) => VrMatches(vr, cp_ids) )
+      .flatMapValues(v => v.cp_ids.map(cp_id => VrMatch(v.vr, cp_id)))
       .selectKey((_, m) => m.cp_id)
-      .join(customerProfileTable)((m: MatchWithVr, cp: CustomerProfile) => MatchWithCpVr(cp, m.vr))
+      .join(customerProfileTable)((m: VrMatch, cp: CustomerProfile) => Match(cp, m.vr))
+
+    cpMatches
+      .merge(vrMatches)
       .mapValues(m => Score(m.cp.id, m.vr.id, (m.cp.value - m.vr.value).abs))
+      .selectKey((_, s) => s.cp_id)
       .groupByKey
       .aggregate(None: Option[Score])(
         (_, score, optMinScore) => {
@@ -112,6 +131,5 @@ object Main {
     assert(resolvedProfiles(5) == new KeyValue(7, ResolvedProfile(7, 3)))
     assert(resolvedProfiles(6) == new KeyValue(8, ResolvedProfile(8, 2)))
     assert(resolvedProfiles(7) == new KeyValue(8, ResolvedProfile(8, 4)))
-
   }
 }
