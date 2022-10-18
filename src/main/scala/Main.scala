@@ -23,7 +23,7 @@ object Main {
   implicit val matchWithCpVrSerde = new JsonSerde[MatchWithCpVr]
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
   implicit val scoreSerde = new JsonSerde[Score]
-  implicit val voterRecordMapSerde = new JsonSerde[Map[Int, VoterRecord]]
+  implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
   implicit val optionalMinScoreSerde = new JsonSerde[Option[Score]]
 
   val CustomerProfileTopic = "CustomerProfile"
@@ -34,7 +34,6 @@ object Main {
   val MatchWithCpVrTopic = "MatchWithCpVr"
   val ScoreTopic = "Score"
   val ResolvedProfileTopic = "ResolvedProfile"
-  val ResolvedProfile2Topic = "ResolvedProfile2"
 
   def buildTopology() = {
     val builder = new StreamsBuilder
@@ -47,29 +46,20 @@ object Main {
     val voterRecordTable = builder
       .table[Int, VoterRecord](VoterRecordTopic)
 
-    val voterRecordsByKeyTable = voterRecordTable
+    val voterRecordIdsByKeyTable = voterRecordTable
       .groupBy((_, vr) => (vr.key, vr))
-      .aggregate(Map(): Map[Int, VoterRecord])(
-        (_, vr, map) => map + (vr.id -> vr),
-        (_, vr, map) => map - vr.id
+      .aggregate(Set(): Set[Int])(
+        (_, vr, set) => set + vr.id,
+        (_, vr, set) => set - vr.id
       )
 
-    def resolve(cp: CustomerProfile, vrs: Map[Int, VoterRecord]): ResolvedProfile = {
-      val vrsList = vrs.values.toList
-      val scores = vrsList.map(vr => (cp.value - vr.value).abs)
-      val vrMatchIndex = scores.zipWithIndex.min._2
-      val vrMatch = vrsList(vrMatchIndex)
-      ResolvedProfile(cp.id, vrMatch.id)
-    }
-
-    def joinMatches(cp: CustomerProfile, vrs: Map[Int, VoterRecord]): Matches = {
-      val vr_ids = vrs.keys.toList
-      Matches(cp.id, vr_ids)
+    def joinMatches(cp: CustomerProfile, vr_ids: Set[Int]): Matches = {
+      Matches(cp.id, vr_ids.toList)
     }
 
     val matchesStream = customerProfileStream
       .selectKey((_, cp) => cp.key)
-      .join(voterRecordsByKeyTable)(joinMatches)
+      .join(voterRecordIdsByKeyTable)(joinMatches)
       .selectKey((_, rp) => rp.cp_id)
     matchesStream.to(MatchesTopic)
 
@@ -90,14 +80,7 @@ object Main {
     scoreStream.to(ScoreTopic)
 
 
-
-    val resolvedProfileStream = customerProfileStream
-      .selectKey((_, cp) => cp.key)
-      .join(voterRecordsByKeyTable)(resolve)
-      .selectKey((_, rp) => rp.cp_id)
-    resolvedProfileStream.to(ResolvedProfileTopic)
-
-    var resolvedProfile2Stream = scoreStream
+    val resolvedProfileStream = scoreStream
       .groupByKey
       .aggregate(None: Option[Score])(
         (_, score, optMinScore) => {
@@ -113,7 +96,7 @@ object Main {
       .toStream
       .mapValues(optMinScore => optMinScore.get)
       .mapValues(score => ResolvedProfile(score.cp_id, score.vr_id))
-    resolvedProfile2Stream.to(ResolvedProfile2Topic)
+    resolvedProfileStream.to(ResolvedProfileTopic)
 
     builder.build()
   }
@@ -163,11 +146,6 @@ object Main {
       intSerde.deserializer(),
       resolvedProfileSerde.deserializer())
 
-    val resolvedProfile2OutputTopic = driver.createOutputTopic(
-      ResolvedProfile2Topic,
-      intSerde.deserializer(),
-      resolvedProfileSerde.deserializer())
-
     val voterRecords = List(
       VoterRecord(1, "a", 1.0),
       VoterRecord(2, "b", 2.0),
@@ -183,13 +161,6 @@ object Main {
       CustomerProfile(8, "b", 3.5),
     )
     customerProfiles.foreach(cp => customerProfileInputTopic.pipeInput(cp.id, cp))
-
-    val resolvedProfiles = resolvedProfileOutputTopic.readValuesToList().toArray()
-
-    assert(resolvedProfiles(0) == ResolvedProfile(5, 1))
-    assert(resolvedProfiles(1) == ResolvedProfile(6, 2))
-    assert(resolvedProfiles(2) == ResolvedProfile(7, 3))
-    assert(resolvedProfiles(3) == ResolvedProfile(8, 4))
 
     val matches = matchesOutputTopic.readValuesToList().toArray()
 
@@ -228,15 +199,15 @@ object Main {
     assert(scores(6) == new KeyValue(8, Score(8, 2, 1.5)))
     assert(scores(7) == new KeyValue(8, Score(8, 4, .5)))
 
-    val resolvedProfiles2 = resolvedProfile2OutputTopic.readKeyValuesToList().toArray()
-    assert(resolvedProfiles2(0) == new KeyValue(5, ResolvedProfile(5, 1)))
-    assert(resolvedProfiles2(1) == new KeyValue(5, ResolvedProfile(5, 1)))
-    assert(resolvedProfiles2(2) == new KeyValue(6, ResolvedProfile(6, 2)))
-    assert(resolvedProfiles2(3) == new KeyValue(6, ResolvedProfile(6, 2)))
-    assert(resolvedProfiles2(4) == new KeyValue(7, ResolvedProfile(7, 1)))
-    assert(resolvedProfiles2(5) == new KeyValue(7, ResolvedProfile(7, 3)))
-    assert(resolvedProfiles2(6) == new KeyValue(8, ResolvedProfile(8, 2)))
-    assert(resolvedProfiles2(7) == new KeyValue(8, ResolvedProfile(8, 4)))
+    val resolvedProfiles = resolvedProfileOutputTopic.readKeyValuesToList().toArray()
+    assert(resolvedProfiles(0) == new KeyValue(5, ResolvedProfile(5, 1)))
+    assert(resolvedProfiles(1) == new KeyValue(5, ResolvedProfile(5, 1)))
+    assert(resolvedProfiles(2) == new KeyValue(6, ResolvedProfile(6, 2)))
+    assert(resolvedProfiles(3) == new KeyValue(6, ResolvedProfile(6, 2)))
+    assert(resolvedProfiles(4) == new KeyValue(7, ResolvedProfile(7, 1)))
+    assert(resolvedProfiles(5) == new KeyValue(7, ResolvedProfile(7, 3)))
+    assert(resolvedProfiles(6) == new KeyValue(8, ResolvedProfile(8, 2)))
+    assert(resolvedProfiles(7) == new KeyValue(8, ResolvedProfile(8, 4)))
 
   }
 }
