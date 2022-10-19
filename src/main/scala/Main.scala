@@ -6,9 +6,6 @@ import Json4SSerde.JsonSerde
 
 case class CustomerProfile(id: Int, key: String, value: Double)
 case class VoterRecord(id: Int, key: String, value: Double)
-case class CpMatches(cp: CustomerProfile, vr_ids: Set[Int])
-case class CpMatch(cp: CustomerProfile, vr_id: Int)
-case class Match(cp: CustomerProfile, vr: VoterRecord)
 case class Score(cp_id: Int, vr_id: Int, score: Double)
 case class ResolvedProfile(cp_id: Int, vr_id: Int)
 
@@ -17,9 +14,6 @@ object Main {
   implicit val customerProfileSerde = new JsonSerde[CustomerProfile]
   implicit val voterRecordSerde = new JsonSerde[VoterRecord]
   implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
-  implicit val cpMatches = new JsonSerde[CpMatches]
-  implicit val cpMatch = new JsonSerde[CpMatch]
-  implicit val matchSerde = new JsonSerde[Match]
   implicit val scoreSerde = new JsonSerde[Score]
   implicit val optionalMinScoreSerde = new JsonSerde[Option[Score]]
   implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
@@ -31,21 +25,19 @@ object Main {
   def buildTopology() = {
     val builder = new StreamsBuilder
     val customerProfileStream = builder.stream[Int, CustomerProfile](CustomerProfileTopic)
-    val voterRecordTable = builder.table[Int, VoterRecord](VoterRecordTopic)
-    val voterRecordIdsByKeyTable = voterRecordTable
-      .groupBy((_, vr) => (vr.key, vr))
+    val voterRecordStream = builder.stream[Int, VoterRecord](VoterRecordTopic)
+    val voterRecordTable = voterRecordStream.toTable
+    val voterRecordIdsByKeyTable = voterRecordStream
+      .groupBy((_, v) => v.key)
       .aggregate(Set(): Set[Int])(
-        (_, vr, set) => set + vr.id,
-        (_, vr, set) => set - vr.id
+        (_, vr, set) => set + vr.id
       )
 
     customerProfileStream
       .selectKey((_, cp) => cp.key)
-      .join(voterRecordIdsByKeyTable)((cp, vr_ids) => CpMatches(cp, vr_ids) )
-      .flatMapValues(v => v.vr_ids.map(vr_id => CpMatch(v.cp, vr_id)))
-      .selectKey((_, m) => m.vr_id)
-      .join(voterRecordTable)((m, vr) => Match(m.cp, vr))
-      .mapValues(m => Score(m.cp.id, m.vr.id, (m.cp.value - m.vr.value).abs))
+      .join(voterRecordIdsByKeyTable)((cp, vr_ids) => (cp, vr_ids) )
+      .flatMap((_, v) => v._2.map(vr_id => (vr_id, v._1)))
+      .join(voterRecordTable)((cp, vr) => Score(cp.id, vr.id, (cp.value - vr.value).abs))
       .groupBy((_, s) => s.cp_id)
       .aggregate(None: Option[Score])(
         (_, score, optMinScore) => {
