@@ -16,7 +16,7 @@ object Main {
   implicit val voterRecordIdSetSerde = new JsonSerde[Set[Int]]
   implicit val scoreSerde = new JsonSerde[Score]
   implicit val optionalMinScoreSerde = new JsonSerde[Option[Score]]
-  implicit val resolvedProfileSerde = new JsonSerde[ResolvedProfile]
+  implicit val resolvedProfileSerde = new JsonSerde[Option[ResolvedProfile]]
 
   val CustomerProfileTopic = "CustomerProfile"
   val VoterRecordTopic = "VoterRecord"
@@ -33,7 +33,8 @@ object Main {
         (_, vr, set) => set + vr.id
       )
 
-    customerProfileStream
+
+    val resolvedProfiles = customerProfileStream
       .selectKey((_, cp) => cp.key)
       .join(voterRecordIdsByKeyTable)((cp, vr_ids) => (cp, vr_ids) )
       .flatMap((_, v) => v._2.map(vr_id => (vr_id, v._1)))
@@ -47,7 +48,17 @@ object Main {
       )
       .toStream
       .mapValues(optMinScore => optMinScore.get)
-      .mapValues(score => ResolvedProfile(score.cp_id, score.vr_id))
+      .mapValues(score => Some(ResolvedProfile(score.cp_id, score.vr_id)) : Option[ResolvedProfile])
+
+    val resolvedProfilesForMissingVoterRecord = customerProfileStream
+      .selectKey((_, cp) => cp.key)
+      .leftJoin(voterRecordIdsByKeyTable)((cp, vr_ids) => (cp, vr_ids == null))
+      .filter((_, v) => v._2)
+      .selectKey((cp, v) => v._1.id)
+      .mapValues(v => None: Option[ResolvedProfile])
+
+    resolvedProfiles
+      .merge(resolvedProfilesForMissingVoterRecord)
       .to(ResolvedProfileTopic)
 
     builder.build()
@@ -69,11 +80,6 @@ object Main {
       voterRecordSerde.serializer()
     )
 
-    val voterRecordInputTopicForDeletes = driver.createInputTopic(
-      VoterRecordTopic,
-      intSerde.serializer(),
-      byteArraySerde.serializer()
-    )
     val resolvedProfileOutputTopic = driver.createOutputTopic(
       ResolvedProfileTopic,
       intSerde.deserializer(),
@@ -92,17 +98,19 @@ object Main {
       CustomerProfile(6, "b", 1.0),
       CustomerProfile(7, "a", 2.5),
       CustomerProfile(8, "b", 3.5),
+      CustomerProfile(9, "c", 1.5)
     )
     customerProfiles.foreach(cp => customerProfileInputTopic.pipeInput(cp.id, cp))
 
     val resolvedProfiles = resolvedProfileOutputTopic.readKeyValuesToList().toArray()
-    assert(resolvedProfiles(0) == new KeyValue(5, ResolvedProfile(5, 1)))
-    assert(resolvedProfiles(1) == new KeyValue(5, ResolvedProfile(5, 1)))
-    assert(resolvedProfiles(2) == new KeyValue(6, ResolvedProfile(6, 2)))
-    assert(resolvedProfiles(3) == new KeyValue(6, ResolvedProfile(6, 2)))
-    assert(resolvedProfiles(4) == new KeyValue(7, ResolvedProfile(7, 1)))
-    assert(resolvedProfiles(5) == new KeyValue(7, ResolvedProfile(7, 3)))
-    assert(resolvedProfiles(6) == new KeyValue(8, ResolvedProfile(8, 2)))
-    assert(resolvedProfiles(7) == new KeyValue(8, ResolvedProfile(8, 4)))
+    assert(resolvedProfiles(0) == new KeyValue(5, Some(ResolvedProfile(5, 1))))
+    assert(resolvedProfiles(1) == new KeyValue(5, Some(ResolvedProfile(5, 1))))
+    assert(resolvedProfiles(2) == new KeyValue(6, Some(ResolvedProfile(6, 2))))
+    assert(resolvedProfiles(3) == new KeyValue(6, Some(ResolvedProfile(6, 2))))
+    assert(resolvedProfiles(4) == new KeyValue(7, Some(ResolvedProfile(7, 1))))
+    assert(resolvedProfiles(5) == new KeyValue(7, Some(ResolvedProfile(7, 3))))
+    assert(resolvedProfiles(6) == new KeyValue(8, Some(ResolvedProfile(8, 2))))
+    assert(resolvedProfiles(7) == new KeyValue(8, Some(ResolvedProfile(8, 4))))
+    assert(resolvedProfiles(8) == new KeyValue(9, None))
   }
 }
